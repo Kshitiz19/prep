@@ -10,8 +10,12 @@ DEPS   := kernels.cuh
 
 all: $(TARGET)
 
+# WSL libcuda.so.1 is not in the ld.so cache, so cudart reports
+# cudaErrorInsufficientDriver. RUNPATH still applies after LD_LIBRARY_PATH.
+LDFLAGS ?= -Xlinker --enable-new-dtags -Xlinker -rpath=/usr/lib/wsl/lib
+
 $(TARGET): $(SRC) $(DEPS)
-	$(NVCC) $(NVCCFLAGS) $(SRC) -o $@
+	$(NVCC) $(NVCCFLAGS) $(LDFLAGS) $(SRC) -o $@
 
 run: $(TARGET)
 	./$(TARGET)

@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cassert>
 #include <cstdlib>
+#include <string>
 #include <cub/cub.cuh>
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
@@ -66,41 +67,96 @@ void device_scan(long long* input, int numBlocks, int blockSize, int size)
     CUDA_CHECK(cudaDeviceSynchronize());
 }
 
-int main()
+constexpr int NUM_BLOCKS = ARRAY_SIZE / (BLOCK_SIZE * STRIPSIZE);
+// warp 0 indexes warp_totals[0..31], so LB kernels need >= 32 slots.
+constexpr size_t LB_SMEM = sizeof(long long) * 64;
+
+struct KernelEntry {
+    const char* name;
+    void (*launch)(long long* input, blockVal* blockOutput);
+};
+
+static const KernelEntry kKernels[] = {
+    { "scan",              [](long long* in, blockVal*)    { device_scan(in, NUM_BLOCKS, BLOCK_SIZE, ARRAY_SIZE); } },
+    { "scan_ILP",          [](long long* in, blockVal*)    { device_scan_ILP(in, NUM_BLOCKS / 2, BLOCK_SIZE, ARRAY_SIZE); } },
+    { "scan_LB",           [](long long* in, blockVal* bo) { scan_LB<<<NUM_BLOCKS, BLOCK_SIZE, LB_SMEM>>>(in, bo); } },
+    { "scan_LB_Final",     [](long long* in, blockVal* bo) { scan_LB_Final<<<NUM_BLOCKS / 2, BLOCK_SIZE, LB_SMEM>>>(in, bo); } },
+    { "scan_LB_Final2",    [](long long* in, blockVal* bo) { scan_LB_Final2<<<NUM_BLOCKS / 2, BLOCK_SIZE, LB_SMEM>>>(in, bo); } },
+};
+
+static bool run_kernel(const KernelEntry& k, const std::vector<long long>& init,
+                       const std::vector<long long>& expected, thrust::device_vector<long long>& input,
+                       blockVal* blockOutput, int iters)
 {
     cudaEvent_t s, e;
-    std::vector<long long> vec(ARRAY_SIZE);
-    std::iota(vec.begin(), vec.end(), 1);
+    CUDA_CHECK(cudaEventCreate(&s));
+    CUDA_CHECK(cudaEventCreate(&e));
+    const int zero = 0;
+    float total_ms = 0.f, min_ms = 1e30f;
 
-    float ms;
-    int numBlocks = ARRAY_SIZE/(BLOCK_SIZE * STRIPSIZE);
+    for (int it = 0; it < iters; ++it) {
+        thrust::copy(init.begin(), init.end(), input.begin());
+        CUDA_CHECK(cudaMemset(blockOutput, 0, sizeof(blockVal) * NUM_BLOCKS));
+        CUDA_CHECK(cudaMemcpyToSymbol(counter, &zero, sizeof(int)));
+        CUDA_CHECK(cudaDeviceSynchronize());
 
-    cudaEventCreate(&s);
-    cudaEventCreate(&e);
-    thrust::device_vector<long long> input = vec;
-    blockVal* blockOutput = nullptr;
-    CUDA_CHECK(cudaMalloc(&blockOutput, sizeof(blockVal) * numBlocks));
-    CUDA_CHECK(cudaMemset(blockOutput, 0, sizeof(blockVal) * numBlocks));
+        CUDA_CHECK(cudaEventRecord(s));
+        k.launch(RAW(input.data()), blockOutput);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaEventRecord(e));
+        CUDA_CHECK(cudaEventSynchronize(e));
 
-    std::inclusive_scan(vec.begin(), vec.end(), vec.begin());
-    cudaEventRecord(s);
-    // device_scan_ILP(RAW(input.data()), ARRAY_SIZE/(BLOCK_SIZE * STRIPSIZE * 2), BLOCK_SIZE, ARRAY_SIZE);
-    // device_scan(RAW(input.data()), ARRAY_SIZE/(BLOCK_SIZE * STRIPSIZE), BLOCK_SIZE, ARRAY_SIZE);
-    // scan_LB<<<numBlocks, BLOCK_SIZE, sizeof(long long) * (BLOCK_SIZE/32 + 1)>>>(RAW(input.data()), blockOutput);
-    // scan_LB_ILP2<<<numBlocks/2, BLOCK_SIZE, sizeof(long long) * (BLOCK_SIZE/32 + 1)>>>(RAW(input.data()), blockOutput);
-    scan_LB_Final2<<<numBlocks/2, BLOCK_SIZE, sizeof(long long) * (64)>>>(RAW(input.data()), blockOutput);
-    cudaEventRecord(e);
-    cudaEventSynchronize(e);
-    cudaEventElapsedTime(&ms, s, e);
-    printf("Kernel complete in %f milliseconds!\n", ms);
+        float ms;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, s, e));
+        total_ms += ms;
+        min_ms = std::min(min_ms, ms);
+    }
+    CUDA_CHECK(cudaEventDestroy(s));
+    CUDA_CHECK(cudaEventDestroy(e));
 
     thrust::host_vector<long long> result = input;
-    std::for_each(
-        std::execution::par_unseq, thrust::counting_iterator<int>(0), thrust::counting_iterator<int>((int)vec.size()), [&] (int index) {
-        assert(vec[index] == (long long)result[index]);
-    });
-    printf("All values matching!\n");
+    auto mm = std::mismatch(std::execution::par_unseq, expected.begin(), expected.end(), result.begin());
+    bool ok = (mm.first == expected.end());
+
+    printf("%-18s iters=%-4d avg=%.4f ms  min=%.4f ms  %s", k.name, iters, total_ms / iters, min_ms,
+           ok ? "PASS\n" : "FAIL");
+    if (!ok) {
+        size_t idx = mm.first - expected.begin();
+        printf(" (first mismatch at %zu: expected %lld, got %lld)\n", idx, *mm.first, *mm.second);
+    }
+    return ok;
+}
+
+static void usage(const char* prog)
+{
+    printf("Usage: %s [kernel|all] [iters]\n  kernels:", prog);
+    for (const auto& k : kKernels) printf(" %s", k.name);
+    printf("\n  default: all 1\n");
+}
+
+int main(int argc, char** argv)
+{
+    std::string which = (argc > 1) ? argv[1] : "all";
+    int iters = (argc > 2) ? std::atoi(argv[2]) : 1;
+    if (which == "-h" || which == "--help" || iters <= 0) { usage(argv[0]); return iters <= 0; }
+
+    std::vector<long long> init(ARRAY_SIZE);
+    std::iota(init.begin(), init.end(), 1);
+    std::vector<long long> expected(ARRAY_SIZE);
+    std::inclusive_scan(init.begin(), init.end(), expected.begin());
+
+    thrust::device_vector<long long> input(ARRAY_SIZE);
+    blockVal* blockOutput = nullptr;
+    CUDA_CHECK(cudaMalloc(&blockOutput, sizeof(blockVal) * NUM_BLOCKS));
+
+    bool all_ok = true, found = false;
+    for (const auto& k : kKernels) {
+        if (which != "all" && which != k.name) continue;
+        found = true;
+        all_ok &= run_kernel(k, init, expected, input, blockOutput, iters);
+    }
+    if (!found) { fprintf(stderr, "Unknown kernel '%s'\n", which.c_str()); usage(argv[0]); }
 
     CUDA_CHECK(cudaFree(blockOutput));
-    return 0;
+    return (found && all_ok) ? 0 : 1;
 }
