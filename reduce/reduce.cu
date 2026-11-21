@@ -26,7 +26,7 @@ int main() {
     CUDA_CHECK(cudaMalloc(&d_output, BLOCKS * sizeof(int)));
     CUDA_CHECK(cudaMemcpy(d_input, input.data(), n * sizeof(int), cudaMemcpyHostToDevice));
 
-    reduce01<<<BLOCKS, THREADS_PER_BLOCK, THREADS_PER_BLOCK * sizeof(int)>>>(d_input, d_output);
+    reduce0<<<BLOCKS, THREADS_PER_BLOCK, THREADS_PER_BLOCK * sizeof(int)>>>(d_input, d_output);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
